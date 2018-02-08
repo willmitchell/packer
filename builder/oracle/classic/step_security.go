@@ -15,49 +15,126 @@ type stepSecurity struct{}
 
 func (s *stepSecurity) Run(_ context.Context, state multistep.StateBag) multistep.StepAction {
 	ui := state.Get("ui").(packer.Ui)
-
-	ui.Say("Configuring security lists and rules to enable SSH access...")
-
 	config := state.Get("config").(*Config)
+
+	commType := ""
+	if config.Comm.Type == "ssh" {
+		commType = "SSH"
+	} else if config.Comm.Type == "winrm" {
+		commType = "WINRM"
+	}
+
+	ui.Say(fmt.Sprintf("Configuring security lists and rules to enable %s access...", commType))
+
 	client := state.Get("client").(*compute.ComputeClient)
 
-	secListName := fmt.Sprintf("/Compute-%s/%s/Packer_SSH_Allow_%s",
-		config.IdentityDomain, config.Username, config.ImageName)
+	secListName := fmt.Sprintf("/Compute-%s/%s/Packer_%s_Allow_%s",
+		config.IdentityDomain, config.Username, commType, config.ImageName)
 	secListClient := client.SecurityLists()
 	secListInput := compute.CreateSecurityListInput{
-		Description: "Packer-generated security list to give packer ssh access",
+		Description: fmt.Sprintf("Packer-generated security list to give packer %s access", commType),
 		Name:        secListName,
 	}
 	_, err := secListClient.CreateSecurityList(&secListInput)
 	if err != nil {
 		if !strings.Contains(err.Error(), "already exists") {
 			err = fmt.Errorf("Error creating security List to"+
-				" allow Packer to connect to Oracle instance via SSH: %s", err)
+				" allow Packer to connect to Oracle instance via %s: %s", commType, err)
 			ui.Error(err.Error())
 			state.Put("error", err)
 			return multistep.ActionHalt
 		}
 	}
 	// DOCS NOTE: user must have Compute_Operations role
-	// Create security rule that allows Packer to connect via SSH
+	// Create security rule that allows Packer to connect via SSH or winRM
+	var application string
+	if commType == "SSH" {
+		application = "/oracle/public/ssh"
+	} else if commType == "WINRM" {
+		// Create winRM protocol; don't need to do this for SSH becasue it is
+		// built into the Oracle API.
+		// input := compute.CreateSecurityProtocolInput{
+		// 	Name:        "WINRM",
+		// 	Description: "packer-generated protocol to allow winRM communicator",
+		// 	DstPortSet:  []string{"5985", "5986"}, // TODO make configurable
+		// 	IPProtocol:  "tcp",
+		// }
+		// protocolClient := client.SecurityProtocols()
+		// secProtocol, err := protocolClient.CreateSecurityProtocol()
+		// if err != nil {
+		// 	err = fmt.Errorf("Error creating security protocol to"+
+		// 		" allow Packer to connect to Oracle instance via %s: %s", commType, err)
+		// 	ui.Error(err.Error())
+		// 	state.Put("error", err)
+		// 	return multistep.ActionHalt
+		// }
+
+		// Create a security Applicatin defining WinRM
+		applicationClient := client.SecurityApplications()
+		applicationInput := compute.CreateSecurityApplicationInput{
+			Description: "Allows Packer to connect to instance via winRM",
+			DPort:       "5985-5986",
+			Name:        "packer_winRM",
+			Protocol:    "TCP",
+		}
+		_, err := applicationClient.CreateSecurityApplication(&applicationInput)
+		if err != nil {
+			err = fmt.Errorf("Error creating security application to"+
+				" allow Packer to connect to Oracle instance via %s: %s", commType, err)
+			ui.Error(err.Error())
+			state.Put("error", err)
+			return multistep.ActionHalt
+		}
+		application = fmt.Sprintf("/Compute-%s/%s/packer_winRM",
+			config.IdentityDomain, config.Username)
+
+		// Create Access Control List
+		aclClient := client.ACLs()
+		createInput := compute.CreateACLInput{
+			Description: "packer winrm acl",
+			Name:        "PackerWinRMACL",
+		}
+		_, err = aclClient.CreateACL(&createInput)
+		if err != nil {
+			err = fmt.Errorf("Error creating ACL to allow Packer to connect to"+
+				" Oracle instance via %s: %s", commType, err)
+			ui.Error(err.Error())
+			state.Put("error", err)
+			return multistep.ActionHalt
+		}
+
+		instanceInfo := state.Get("instance_net").(compute.InstanceInfo)
+		log.Printf("MEGAN instanceInfo is %#v", instanceInfo)
+		log.Printf("MEGAN vnic is %s", instanceInfo.Networking.Vnic)
+
+		// Create vNICset
+		nicSetClient := client.VirtNICSets()
+		nicInput := compute.CreateVirtualNICSetInput{
+			Name:        "PackerWinRM",
+			Description: "allow packer to connect via winRM",
+			VirtualNICs: []string{"eth0"},
+			AppliedACLs: []string{fmt.Sprintf("/Compute-%s/%s/PackerWinRMACL", config.IdentityDomain, config.Username)},
+		}
+		nicSetClient.CreateVirtualNICSet(&nicInput)
+	}
 	secRulesClient := client.SecRules()
 	secRulesInput := compute.CreateSecRuleInput{
 		Action:          "PERMIT",
-		Application:     "/oracle/public/ssh",
-		Description:     "Packer-generated security rule to allow ssh",
+		Application:     application,
+		Description:     "Packer-generated security rule to allow ssh/winrm",
 		DestinationList: fmt.Sprintf("seclist:%s", secListName),
-		Name:            fmt.Sprintf("Packer-allow-SSH-Rule_%s", config.ImageName),
+		Name:            fmt.Sprintf("Packer-allow-%s-Rule_%s", commType, config.ImageName),
 		SourceList:      config.SSHSourceList,
 	}
 
-	secRuleName := fmt.Sprintf("/Compute-%s/%s/Packer-allow-SSH-Rule_%s",
-		config.IdentityDomain, config.Username, config.ImageName)
+	secRuleName := fmt.Sprintf("/Compute-%s/%s/Packer-allow-%s-Rule_%s",
+		config.IdentityDomain, config.Username, commType, config.ImageName)
 	_, err = secRulesClient.CreateSecRule(&secRulesInput)
 	if err != nil {
-		log.Printf("Error creating security rule to allow SSH: %s", err.Error())
+		log.Printf("Error creating security rule to allow %s: %s", commType, err.Error())
 		if !strings.Contains(err.Error(), "already exists") {
 			err = fmt.Errorf("Error creating security rule to"+
-				" allow Packer to connect to Oracle instance via SSH: %s", err)
+				" allow Packer to connect to Oracle instance via commType: %s", commType, err)
 			ui.Error(err.Error())
 			state.Put("error", err)
 			return multistep.ActionHalt
