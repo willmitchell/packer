@@ -33,6 +33,7 @@ func (s *stepSnapshot) Run(_ context.Context, state multistep.StateBag) multiste
 		err = fmt.Errorf("Problem creating snapshot: %s", err)
 		ui.Error(err.Error())
 		state.Put("error", err)
+		state.Put("cleanup_snap", false)
 		return multistep.ActionHalt
 	}
 
@@ -44,6 +45,9 @@ func (s *stepSnapshot) Run(_ context.Context, state multistep.StateBag) multiste
 func (s *stepSnapshot) Cleanup(state multistep.StateBag) {
 	// Delete the snapshot
 	ui := state.Get("ui").(packer.Ui)
+	if !state.Get("cleanup_snap").(bool) {
+		return
+	}
 	ui.Say("Deleting Snapshot...")
 	client := state.Get("client").(*compute.ComputeClient)
 	snap := state.Get("snapshot").(*compute.Snapshot)

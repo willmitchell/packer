@@ -48,7 +48,7 @@ func (s *stepCreateInstance) Run(_ context.Context, state multistep.StateBag) mu
 		return multistep.ActionHalt
 	}
 
-	state.Put("instance_net", instanceInfo)
+	state.Put("instance_info", instanceInfo)
 	state.Put("instance_id", instanceInfo.ID)
 	ui.Message(fmt.Sprintf("Created instance: %s.", instanceInfo.ID))
 	return multistep.ActionContinue
